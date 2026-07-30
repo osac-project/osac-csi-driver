@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"os"
@@ -8,6 +9,11 @@ import (
 
 	"github.com/osac-project/osac-csi-driver/pkg/driver"
 	"github.com/osac-project/osac-csi-driver/pkg/fulfillment"
+	"golang.org/x/oauth2"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/credentials/oauth"
+	experimentalcredentials "google.golang.org/grpc/experimental/credentials"
 	"k8s.io/klog/v2"
 )
 
@@ -23,6 +29,10 @@ func main() {
 	nodeID := flag.String("node-id", "", "Node ID for NodeGetInfo")
 	fulfillmentEndpoint := flag.String("fulfillment-endpoint", "",
 		"gRPC endpoint for the OSAC fulfillment service (uses stub if empty)")
+	fulfillmentTokenFile := flag.String("fulfillment-token-file", "",
+		"Path to a file containing the bearer token for fulfillment-service authentication")
+	grpcPlaintext := flag.Bool("grpc-plaintext", false, "Use insecure (plaintext) gRPC connection")
+	grpcInsecure := flag.Bool("grpc-insecure", false, "Skip TLS server certificate verification")
 	vendorSocketsFlag := flag.String("vendor-sockets", "",
 		"Comma-separated backend=socketpath pairs (e.g. ontap=/csi/trident/csi.sock)")
 	driverName := flag.String("driver-name", "csi.osac.openshift.io", "CSI driver name")
@@ -47,8 +57,15 @@ func main() {
 
 	var fulfillmentClient fulfillment.Client
 	if *fulfillmentEndpoint != "" {
-		klog.Infof("Fulfillment endpoint: %s (real gRPC client not yet implemented, using stub)", *fulfillmentEndpoint)
-		fulfillmentClient = &fulfillment.LoggingStub{}
+		opts, err := buildGRPCDialOptions(*grpcPlaintext, *grpcInsecure, *fulfillmentTokenFile)
+		if err != nil {
+			klog.Fatalf("Failed to build gRPC options: %v", err)
+		}
+		fulfillmentClient, err = fulfillment.NewGRPCClient(*fulfillmentEndpoint, vendorSockets, opts...)
+		if err != nil {
+			klog.Fatalf("Failed to create fulfillment gRPC client: %v", err)
+		}
+		klog.Infof("Fulfillment endpoint: %s (gRPC client)", *fulfillmentEndpoint)
 	} else {
 		klog.Infof("No fulfillment endpoint configured, using logging stub")
 		fulfillmentClient = &fulfillment.LoggingStub{}
@@ -63,6 +80,44 @@ func main() {
 	if err := d.Run(); err != nil {
 		klog.Fatalf("Failed to run driver: %v", err)
 	}
+}
+
+func buildGRPCDialOptions(plaintext, insecureSkipVerify bool, tokenFile string) ([]grpc.DialOption, error) {
+	var opts []grpc.DialOption
+
+	if plaintext {
+		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	} else {
+		tlsCfg := &tls.Config{
+			InsecureSkipVerify: insecureSkipVerify, //nolint:gosec // user-controlled flag
+		}
+		opts = append(opts, grpc.WithTransportCredentials(experimentalcredentials.NewTLSWithALPNDisabled(tlsCfg)))
+	}
+
+	if tokenFile != "" {
+		opts = append(opts, grpc.WithPerRPCCredentials(
+			oauth.TokenSource{TokenSource: &fileTokenSource{path: tokenFile}},
+		))
+	}
+
+	return opts, nil
+}
+
+// fileTokenSource reads a bearer token from a file on each call, so
+// rotated tokens are picked up without a restart.
+type fileTokenSource struct {
+	path string
+}
+
+func (f *fileTokenSource) Token() (*oauth2.Token, error) {
+	data, err := os.ReadFile(f.path)
+	if err != nil {
+		return nil, fmt.Errorf("reading token file %s: %w", f.path, err)
+	}
+	return &oauth2.Token{
+		AccessToken: strings.TrimSpace(string(data)),
+		TokenType:   "Bearer",
+	}, nil
 }
 
 func parseVendorSockets(s string) (map[string]string, error) {
